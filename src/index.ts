@@ -15,11 +15,16 @@
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { writeFileSync, existsSync } from 'fs';
 import * as readline from 'readline';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { AaveClient } from './aaveClient.js';
 import { RiskEngine } from './riskEngine.js';
 import { LoopEngine } from './loopEngine.js';
 import { Monitor } from './monitor.js';
 import { CONFIG, EMODE, logConfig } from './config.js';
+import { keystoreExists, createKeystore, loadKeystore, promptPassword } from './keystore.js';
+
+const KEYSTORE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'wallet.enc');
 
 // ---------------------------------------------------------------------------
 // Readline Helper – fragt den Nutzer nach Eingabe
@@ -39,12 +44,22 @@ function ask(rl: readline.Interface, question: string): Promise<string> {
   });
 }
 
+// autoApprove-Flag: wird gesetzt wenn User "a" wählt → alle weiteren confirms automatisch true
+let autoApprove = false;
+
 async function confirm(rl: readline.Interface, message: string): Promise<boolean> {
+  if (autoApprove) return true;
   while (true) {
-    const answer = await ask(rl, `\n  ${message} [j/n]: `);
-    if (answer.toLowerCase() === 'j' || answer.toLowerCase() === 'ja') return true;
-    if (answer.toLowerCase() === 'n' || answer.toLowerCase() === 'nein') return false;
-    console.log('  Bitte "j" oder "n" eingeben.');
+    const answer = await ask(rl, `\n  ${message} [j/n/a]: `);
+    const lower = answer.toLowerCase();
+    if (lower === 'j' || lower === 'ja') return true;
+    if (lower === 'n' || lower === 'nein') return false;
+    if (lower === 'a' || lower === 'alle') {
+      autoApprove = true;
+      console.log('  → Alle weiteren Schritte werden automatisch bestätigt.');
+      return true;
+    }
+    console.log('  Bitte "j", "n" oder "a" (alle) eingeben.');
   }
 }
 
@@ -165,126 +180,138 @@ function hasFlag(flag: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Hilfsfunktion: Prozess mit gesetztem PRIVATE_KEY neu starten
-// ---------------------------------------------------------------------------
-async function restartWithKey(key: string): Promise<never> {
-  const { execFileSync } = await import('child_process');
-  const isTsx = process.argv[1]?.endsWith('.ts') || process.execArgv.some(a => a.includes('tsx'));
-  if (isTsx) {
-    const tsxBin = new URL('../node_modules/.bin/tsx', import.meta.url).pathname;
-    execFileSync(tsxBin, process.argv.slice(1), {
-      stdio: 'inherit',
-      env: { ...process.env, PRIVATE_KEY: key },
-    });
-  } else {
-    execFileSync(process.execPath, process.argv.slice(1), {
-      stdio: 'inherit',
-      env: { ...process.env, PRIVATE_KEY: key },
-    });
-  }
-  process.exit(0);
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
-  const envPath = new URL('../.env', import.meta.url).pathname;
-  const { readFileSync: fsRead } = await import('fs');
+  // ── Wallet-Auswahl via Keystore ───────────────────────────────────────────
+  if (keystoreExists(KEYSTORE_PATH)) {
+    // Keystore vorhanden → Passwort abfragen und entschlüsseln
+    console.log('');
+    console.log('  ┌─── Encrypted Keystore gefunden ─────────────────────────┐');
+    console.log(`  │  Datei: ${KEYSTORE_PATH}`);
+    console.log('  └─────────────────────────────────────────────────────────┘');
+    console.log('');
 
-  // ── Wallet-Auswahl ────────────────────────────────────────────────────────
-  if (!CONFIG.privateKey || CONFIG.privateKey === '0xYOUR_PRIVATE_KEY_HERE') {
-    // Prüfe ob .env bereits einen Key enthält (wurde nicht per process.env übergeben)
-    let envKey: string | null = null;
-    if (existsSync(envPath)) {
-      const envContent = fsRead(envPath, 'utf8');
-      const match = envContent.match(/^PRIVATE_KEY=(0x[0-9a-fA-F]+)\s*$/m);
-      if (match) envKey = match[1];
+    let privateKey: string;
+    try {
+      const password = await promptPassword('  Wallet-Passwort: ', false);
+      console.log('');
+      process.stdout.write('  Entschlüssele Keystore...');
+      privateKey = loadKeystore(password, KEYSTORE_PATH);
+      console.log(' ✓');
+    } catch (err) {
+      console.log('');
+      console.error(`  ✗ ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
     }
 
-    if (envKey) {
-      // .env hat einen Key – nachfragen ob verwendet werden soll
-      const account = privateKeyToAccount(envKey as `0x${string}`);
-      console.log('');
-      console.log('  ┌─── Wallet gefunden in .env ─────────────────────────────┐');
-      console.log(`  │  Adresse: ${account.address}  │`);
-      console.log('  └─────────────────────────────────────────────────────────┘');
-      console.log('');
+    CONFIG.privateKey = privateKey as `0x${string}`;
+    const account = privateKeyToAccount(CONFIG.privateKey);
+    console.log(`  Wallet: ${account.address}`);
+    console.log('');
 
-      // Einfache synchrone Abfrage (rl noch nicht initialisiert)
-      const rlTemp = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-      const useExisting = await new Promise<boolean>(resolve => {
-        process.stdout.write('  Gespeicherte Wallet verwenden? [j/n]: ');
-        rlTemp.once('line', ans => {
-          rlTemp.close();
-          resolve(ans.trim().toLowerCase() === 'j' || ans.trim().toLowerCase() === 'ja');
-        });
-      });
-
-      if (useExisting) {
-        console.log('  ✓ Verwende gespeicherte Wallet.\n');
-        await restartWithKey(envKey);
-      } else {
-        console.log('');
-        console.log('  Neue Wallet generieren? Der alte Key in .env wird ersetzt.');
-        const rlTemp2 = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-        const doNew = await new Promise<boolean>(resolve => {
-          process.stdout.write('  Neue Wallet generieren? [j/n]: ');
-          rlTemp2.once('line', ans => {
-            rlTemp2.close();
-            resolve(ans.trim().toLowerCase() === 'j' || ans.trim().toLowerCase() === 'ja');
-          });
-        });
-        if (!doNew) {
-          console.log('  Abgebrochen. Trage PRIVATE_KEY manuell in .env ein.');
-          process.exit(0);
-        }
-        // Neue Wallet generieren (Altkey wird ersetzt – weiter unten)
-      }
-    }
-
-    // Neue Wallet generieren
-    const newKey = generatePrivateKey();
-    const account = privateKeyToAccount(newKey);
-
+  } else {
+    // Kein Keystore → Setup-Wizard
     console.log('');
     console.log('╔═══════════════════════════════════════════════════════════╗');
-    console.log('║           NEUE WALLET GENERIERT                          ║');
-    console.log('╠═══════════════════════════════════════════════════════════╣');
-    console.log(`║  Adresse:     ${account.address}  ║`);
-    console.log(`║  Private Key: ${newKey}  ║`);
-    console.log('╠═══════════════════════════════════════════════════════════╣');
-    console.log('║  ⚠️  Sichere den Private Key sofort!                      ║');
-    console.log('║  Import in Rabby: Einstellungen → Konten → Private Key   ║');
+    console.log('║       ERSTER START – WALLET SETUP                        ║');
+    console.log('║  Kein Keystore gefunden. Bitte wählen:                   ║');
+    console.log('║    [1] Bestehenden Private Key verschlüsseln             ║');
+    console.log('║    [2] Neue Wallet generieren                            ║');
     console.log('╚═══════════════════════════════════════════════════════════╝');
     console.log('');
 
-    // In .env schreiben (anlegen oder PRIVATE_KEY ersetzen)
-    const envLine = `PRIVATE_KEY=${newKey}`;
-    if (existsSync(envPath)) {
-      let envContent = fsRead(envPath, 'utf8');
-      if (/^PRIVATE_KEY=/m.test(envContent)) {
-        envContent = envContent.replace(/^PRIVATE_KEY=.*$/m, envLine);
-      } else {
-        envContent = envContent.trimEnd() + '\n' + envLine + '\n';
+    // Einfache Zeilen-Eingabe über Raw-Mode (kompatibel mit promptPassword)
+    const readLine = (prompt: string): Promise<string> => new Promise(resolve => {
+      process.stdout.write(prompt);
+      const stdin = process.stdin;
+      const wasPaused = stdin.isPaused();
+      if (stdin.isTTY) stdin.setRawMode(true);
+      stdin.resume();
+      stdin.setEncoding('utf8');
+      let buf = '';
+      const onData = (chunk: string) => {
+        for (const char of chunk) {
+          const code = char.charCodeAt(0);
+          if (char === '\r' || char === '\n' || code === 13 || code === 10) {
+            stdin.removeListener('data', onData);
+            if (stdin.isTTY) stdin.setRawMode(false);
+            if (wasPaused) stdin.pause();
+            process.stdout.write('\n');
+            resolve(buf);
+            return;
+          }
+          if (code === 3) { process.stdout.write('\n'); process.exit(130); }
+          if (code === 127 || code === 8) {
+            if (buf.length > 0) { buf = buf.slice(0, -1); process.stdout.write('\b \b'); }
+          } else if (code >= 32) {
+            buf += char; process.stdout.write(char);
+          }
+        }
+      };
+      stdin.on('data', onData);
+    });
+
+    const choice = await readLine('  Auswahl [1/2]: ');
+
+    let privateKey: string;
+
+    if (choice === '1') {
+      // Bestehenden Key eingeben (sichtbar, da kein Sicherheitsrisiko beim Eintippen in eigenem Terminal)
+      privateKey = await readLine('  Private Key (0x...): ');
+      if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
+        console.error('  ✗ Ungültiger Private Key (muss 0x + 64 Hex-Zeichen sein).');
+        process.exit(1);
       }
-      writeFileSync(envPath, envContent, 'utf8');
     } else {
-      writeFileSync(envPath, envLine + '\n', 'utf8');
+      // Neue Wallet generieren
+      privateKey = generatePrivateKey();
+      const account = privateKeyToAccount(privateKey as `0x${string}`);
+      console.log('');
+      console.log('╔═══════════════════════════════════════════════════════════╗');
+      console.log('║           NEUE WALLET GENERIERT                          ║');
+      console.log('╠═══════════════════════════════════════════════════════════╣');
+      console.log(`║  Adresse:     ${account.address}  ║`);
+      console.log(`║  Private Key: ${privateKey}  ║`);
+      console.log('╠═══════════════════════════════════════════════════════════╣');
+      console.log('║  ⚠️  Notiere den Private Key jetzt – er wird danach      ║');
+      console.log('║      nur noch verschlüsselt gespeichert!                 ║');
+      console.log('╚═══════════════════════════════════════════════════════════╝');
+      console.log('');
     }
-    console.log(`  ✓ Private Key in .env gespeichert (${envPath})`);
-    console.log('  Bot startet neu mit der neuen Wallet...\n');
-    await restartWithKey(newKey);
+
+    // Passwort für Keystore wählen
+    console.log('  Wähle ein Passwort für den Keystore (mind. 8 Zeichen):');
+    let password: string;
+    try {
+      password = await promptPassword('  Passwort: ', true);
+    } catch (err) {
+      console.error(`  ✗ ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+
+    // Keystore erstellen
+    process.stdout.write('  Erstelle Keystore (scrypt KDF – dauert ~1s)...');
+    createKeystore(privateKey, password, KEYSTORE_PATH);
+    console.log(' ✓');
+    console.log(`  Keystore gespeichert: ${KEYSTORE_PATH}`);
+    console.log('');
+    console.log('  Hinweis: PRIVATE_KEY in .env wird nicht mehr benötigt.');
+    console.log('           Du kannst ihn aus .env entfernen.');
+    console.log('');
+
+    CONFIG.privateKey = privateKey as `0x${string}`;
+    const account = privateKeyToAccount(CONFIG.privateKey);
+    console.log(`  Wallet: ${account.address}`);
+    console.log('');
   }
 
   // ── Readline Interface ────────────────────────────────────────────────────
   const rl = createRL();
 
-  // ── Parameter-Wizard (wenn --no-wizard NICHT gesetzt) ────────────────────
-  const action = getAction();
-  const skipWizard = hasFlag('--no-wizard') || ['status', 'unwind', 'unwind-loop', 'emode'].includes(action);
-
-  if (!skipWizard) {
+  // ── Parameter-Wizard (einmalig bei Direktaufruf ohne --action) ───────────
+  const initialAction = getAction();
+  if (!hasFlag('--no-wizard') && initialAction === 'wizard') {
     await runParameterWizard(rl);
   }
 
@@ -297,8 +324,13 @@ async function main() {
   const monitor = new Monitor(aave, risk, loop);
 
   console.log(`  Wallet: ${aave.userAddress}`);
-  console.log(`\n  Action: ${action}\n`);
 
+  // ── Aktions-Schleife ──────────────────────────────────────────────────────
+  // Bei direktem --action=X wird nur diese eine Aktion ausgeführt, dann Ende.
+  // Im Wizard-Modus (kein --action) läuft die Schleife bis [0] Beenden.
+  const isWizardMode = initialAction === 'wizard';
+
+  const runAction = async (action: string): Promise<void> => {
   switch (action) {
     // =====================================================================
     // STATUS: Zeige Account-Daten
@@ -333,12 +365,12 @@ async function main() {
     // =====================================================================
     case 'test': {
       console.log('╔═══════════════════════════════════════════════════════════╗');
-      console.log('║           TESTMODUS – EIN LOOP-SCHRITT                   ║');
-      console.log('║  Führt genau eine Iteration aus:                         ║');
-      console.log('║    1. Kurs-Check AVAX → sAVAX                            ║');
-      console.log('║    2. AVAX → sAVAX tauschen (BENQI)                      ║');
-      console.log('║    3. sAVAX als Collateral auf Aave supplyen             ║');
-      console.log('║    4. WAVAX gegen sAVAX borgen                           ║');
+      console.log('║           TESTMODUS – EIN LOOP-SCHRITT                    ║');
+      console.log('║  Führt genau eine Iteration aus:                          ║');
+      console.log('║    1. Kurs-Check AVAX → sAVAX                             ║');
+      console.log('║    2. AVAX → sAVAX tauschen (BENQI)                       ║');
+      console.log('║    3. sAVAX als Collateral auf Aave supplyen              ║');
+      console.log('║    4. WAVAX gegen sAVAX borgen                            ║');
       console.log('╚═══════════════════════════════════════════════════════════╝');
       console.log('');
 
@@ -463,7 +495,10 @@ async function main() {
       if (!ok2) { console.log('  Abgebrochen.'); break; }
 
       console.log('');
-      const { sAvaxReceived } = await aave.stakeAvaxForSAvax(testAmount);
+      const { sAvaxReceived } = await aave.swapAvaxForSAvax(
+        testAmount,
+        async () => confirm(rl, 'Swap nach 3 Versuchen fehlgeschlagen. Nochmals versuchen?'),
+      );
 
       // Tausch-Ergebnis vs. KyberSwap-Quote prüfen
       const actualSAvax = Number(formatEther(sAvaxReceived));
@@ -630,18 +665,17 @@ async function main() {
       const ok2 = await confirm(rl, 'Bist du sicher? Dies kann nicht rückgängig gemacht werden.');
       if (!ok2) { console.log('  Abgebrochen.'); break; }
 
-      const result = await loop.fullUnwind();
+      const result = await loop.unwindLoop(rl, confirm);
       console.log(`\n  Result: ${result.success ? '✓' : '✗'} – ${result.reason}`);
       await aave.printStatus();
       break;
     }
 
     // =====================================================================
-    // UNWIND-LOOP: Iterativer Abbau via withdraw sAVAX → swap → wrap → repay
+    // UNWIND-LOOP: identisch mit unwind (beide nutzen unwindLoop)
     // =====================================================================
     case 'unwind-loop': {
       console.log('⚠️  WARNUNG: Dies baut den gesamten Leverage iterativ ab!');
-      console.log('   Jede Iteration: withdraw sAVAX → swap sAVAX→AVAX → wrap AVAX→WAVAX → repay WAVAX');
       const snap = await aave.printStatus();
 
       if (snap.totalDebtUsd === 0 && snap.totalCollateralUsd === 0) {
@@ -704,50 +738,6 @@ async function main() {
       break;
     }
 
-    // =====================================================================
-    // WIZARD (Default ohne --action): Interaktiver Einstieg
-    // =====================================================================
-    case 'wizard': {
-      console.log('');
-      console.log('  Aktueller Status wird geladen...');
-      await aave.printStatus();
-
-      console.log('  Wähle eine Aktion:');
-      console.log('  [1] status       – Account Status anzeigen');
-      console.log('  [2] test         – Testmodus (ein Schritt)');
-      console.log('  [3] emode        – E-Mode aktivieren');
-      console.log('  [4] loop         – Leverage-Loop aufbauen');
-      console.log('  [5] monitor      – HF-Monitor starten');
-      console.log('  [6] deleverage   – Manuelles Deleverage');
-      console.log('  [7] unwind       – Alle Positionen schließen (fullUnwind)');
-      console.log('  [8] unwind-loop  – Loop iterativ abbauen (sAVAX→AVAX→repay)');
-      console.log('');
-
-      const choice = await ask(rl, '  Auswahl [1-8]: ');
-      const actionMap: Record<string, string> = {
-        '1': 'status', '2': 'test', '3': 'emode',
-        '4': 'loop',   '5': 'monitor', '6': 'deleverage',
-        '7': 'unwind', '8': 'unwind-loop',
-      };
-      const chosen = actionMap[choice];
-      if (!chosen) {
-        console.log('  Ungültige Auswahl.');
-        break;
-      }
-
-      // Neustart mit gewählter Action (ohne Wizard)
-      const { execFileSync } = await import('child_process');
-      const isTsx = process.argv[1]?.endsWith('.ts') || process.execArgv.some(a => a.includes('tsx'));
-      const args = [...process.argv.slice(1), `--action=${chosen}`, '--no-wizard'];
-      if (isTsx) {
-        const tsxBin = new URL('../node_modules/.bin/tsx', import.meta.url).pathname;
-        execFileSync(tsxBin, args, { stdio: 'inherit', env: process.env });
-      } else {
-        execFileSync(process.execPath, args, { stdio: 'inherit', env: process.env });
-      }
-      break;
-    }
-
     default:
       console.error(`  Unbekannte Action: ${action}`);
       console.log('  Verfügbare Actions:');
@@ -760,6 +750,54 @@ async function main() {
       console.log('    --action=unwind-loop  Loop iterativ abbauen (sAVAX→AVAX→repay)');
       console.log('    --action=emode        E-Mode aktivieren');
       process.exit(1);
+  }
+  }; // Ende runAction
+
+  if (isWizardMode) {
+    // ── Interaktive Hauptschleife ─────────────────────────────────────────
+    const actionMap: Record<string, string> = {
+      '1': 'status', '2': 'test', '3': 'emode',
+      '4': 'loop',   '5': 'monitor', '6': 'deleverage',
+      '7': 'unwind', '8': 'unwind-loop',
+    };
+
+    while (true) {
+      console.log('');
+      console.log('┌─────────────────────────────────────────────────────────────┐');
+      console.log('│  Wähle eine Aktion:                                         │');
+      console.log('│  [1] status       – Account Status anzeigen                 │');
+      console.log('│  [2] test         – Testmodus (ein Schritt)                 │');
+      console.log('│  [3] emode        – E-Mode aktivieren                       │');
+      console.log('│  [4] loop         – Leverage-Loop aufbauen                  │');
+      console.log('│  [5] monitor      – HF-Monitor starten                      │');
+      console.log('│  [6] deleverage   – Manuelles Deleverage                    │');
+      console.log('│  [7] unwind       – Alle Positionen schließen (fullUnwind)  │');
+      console.log('│  [8] unwind-loop  – Loop iterativ abbauen                   │');
+      console.log('│  [0] Beenden                                                 │');
+      console.log('└─────────────────────────────────────────────────────────────┘');
+
+      const choice = await ask(rl, '  Auswahl [0-8]: ');
+
+      if (choice === '0') {
+        console.log('  Auf Wiedersehen!');
+        break;
+      }
+
+      const chosen = actionMap[choice];
+      if (!chosen) {
+        console.log('  Ungültige Auswahl – bitte 0-8 eingeben.');
+        continue;
+      }
+
+      console.log('');
+      await runAction(chosen);
+      autoApprove = false; // Reset nach jeder Aktion
+      // monitor endet nie über die Schleife (SIGINT handled intern)
+    }
+  } else {
+    // ── Direkt-Aufruf via --action=X ─────────────────────────────────────
+    console.log(`\n  Action: ${initialAction}\n`);
+    await runAction(initialAction);
   }
 
   rl.close();

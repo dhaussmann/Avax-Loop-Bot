@@ -20,7 +20,7 @@ import {
 import { avalanche } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
 import { CONFIG, ADDRESSES, EMODE } from './config.js';
-import { AAVE_V3_POOL_ABI, ERC20_ABI, SAVAX_ABI, WAVAX_ABI, AAVE_ORACLE_ABI } from './abis.js';
+import { AAVE_V3_POOL_ABI, ERC20_ABI, SAVAX_ABI, WAVAX_ABI, AAVE_ORACLE_ABI, WRAPPED_TOKEN_GATEWAY_ABI } from './abis.js';
 import { KyberSwapClient, NATIVE_AVAX, SAVAX_ADDRESS } from './kyberswap.js';
 
 // ---------------------------------------------------------------------------
@@ -74,9 +74,37 @@ export class AaveClient {
   }
 
   // =========================================================================
+  // INTERN: waitForReceipt – mit Retry bei "unfinalized data" RPC-Fehler
+  // =========================================================================
+
+  private async waitForReceipt(hash: `0x${string}`, maxRetries = 12): Promise<{ status: 'success' | 'reverted' }> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.publicClient.waitForTransactionReceipt({ hash, timeout: 90_000 });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isRetryable =
+          msg.includes('unfinalized') ||
+          msg.includes('cannot query') ||
+          msg.includes('could not be found') ||
+          msg.includes('not processed on a block') ||
+          msg.includes('TransactionReceiptNotFound');
+        if (isRetryable) {
+          const delay = attempt * 2000;
+          console.log(`  ⚠ Warte auf Tx-Bestätigung (Versuch ${attempt}/${maxRetries}, ${delay}ms)...`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error(`waitForReceipt: Tx ${hash} nach ${maxRetries} Versuchen nicht bestätigt.`);
+  }
+
+  // =========================================================================
   // READ: Account Data
   // =========================================================================
-  
+
   async getAccountData(): Promise<AccountData> {
     const result = await this.publicClient.readContract({
       address: ADDRESSES.pool,
@@ -197,7 +225,7 @@ export class AaveClient {
       args: [EMODE.categoryId],
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ E-Mode aktiviert: ${hash}`);
     return hash;
   }
@@ -230,7 +258,7 @@ export class AaveClient {
       args: [spender, amount],
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Approved: ${hash}`);
   }
 
@@ -238,7 +266,10 @@ export class AaveClient {
   // WRITE: AVAX → sAVAX via KyberSwap Aggregator
   // =========================================================================
 
-  async swapAvaxForSAvax(avaxAmount: bigint): Promise<{ hash: `0x${string}`; sAvaxReceived: bigint; quote: import('./kyberswap.js').SwapQuote }> {
+  async swapAvaxForSAvax(
+    avaxAmount: bigint,
+    onRetryExhausted?: () => Promise<boolean>,
+  ): Promise<{ hash: `0x${string}`; sAvaxReceived: bigint; quote: import('./kyberswap.js').SwapQuote }> {
     console.log(`  → Swap ${formatEther(avaxAmount)} AVAX → sAVAX via KyberSwap...`);
 
     const { hash, amountOut, quote } = await this.kyberswap.swap(
@@ -246,6 +277,8 @@ export class AaveClient {
       SAVAX_ADDRESS,
       avaxAmount,
       'sAVAX',
+      1,
+      onRetryExhausted,
     );
 
     // amountOut aus KyberSwap Build-Response verwenden (zuverlässiger als Balance-Differenz)
@@ -254,9 +287,39 @@ export class AaveClient {
   }
 
   /** @deprecated Verwende swapAvaxForSAvax() – bleibt für Rückwärtskompatibilität */
-  async stakeAvaxForSAvax(avaxAmount: bigint): Promise<{ hash: `0x${string}`; sAvaxReceived: bigint }> {
-    const result = await this.swapAvaxForSAvax(avaxAmount);
+  async stakeAvaxForSAvax(
+    avaxAmount: bigint,
+    onRetryExhausted?: () => Promise<boolean>,
+  ): Promise<{ hash: `0x${string}`; sAvaxReceived: bigint }> {
+    const result = await this.swapAvaxForSAvax(avaxAmount, onRetryExhausted);
     return { hash: result.hash, sAvaxReceived: result.sAvaxReceived };
+  }
+
+  // =========================================================================
+  // WRITE: WAVAX → sAVAX via KyberSwap (kein Unwrap nötig)
+  // =========================================================================
+
+  async swapWavaxForSAvax(
+    wavaxAmount: bigint,
+    onRetryExhausted?: () => Promise<boolean>,
+  ): Promise<{ hash: `0x${string}`; sAvaxReceived: bigint }> {
+    console.log(`  → Swap ${formatEther(wavaxAmount)} WAVAX → sAVAX via KyberSwap...`);
+
+    // WAVAX-Approval für KyberSwap Router (Adresse kommt aus Quote)
+    const quote = await this.kyberswap.fetchQuoteOnly(ADDRESSES.WAVAX, SAVAX_ADDRESS, wavaxAmount);
+    await this.ensureApproval(ADDRESSES.WAVAX, quote.routerAddress, wavaxAmount);
+
+    const { hash, amountOut } = await this.kyberswap.swap(
+      ADDRESSES.WAVAX,
+      SAVAX_ADDRESS,
+      wavaxAmount,
+      'sAVAX',
+      1,
+      onRetryExhausted,
+    );
+
+    console.log(`  ✓ Erhalten: ${formatEther(amountOut)} sAVAX`);
+    return { hash, sAvaxReceived: amountOut };
   }
 
   // =========================================================================
@@ -272,7 +335,7 @@ export class AaveClient {
       args: [],
       value: amount,
     });
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Wrapped: ${hash}`);
     return hash;
   }
@@ -281,7 +344,10 @@ export class AaveClient {
   // WRITE: sAVAX → AVAX via KyberSwap
   // =========================================================================
 
-  async swapSAvaxForAvax(sAvaxAmount: bigint): Promise<{ hash: `0x${string}`; avaxReceived: bigint }> {
+  async swapSAvaxForAvax(
+    sAvaxAmount: bigint,
+    onRetryExhausted?: () => Promise<boolean>,
+  ): Promise<{ hash: `0x${string}`; avaxReceived: bigint }> {
     console.log(`  → Swap ${formatEther(sAvaxAmount)} sAVAX → AVAX via KyberSwap...`);
 
     // sAVAX approval für KyberSwap Router
@@ -293,10 +359,43 @@ export class AaveClient {
       NATIVE_AVAX,
       sAvaxAmount,
       'AVAX',
+      1,
+      onRetryExhausted,
     );
 
     console.log(`  ✓ Erhalten: ${formatEther(amountOut)} AVAX`);
     return { hash, avaxReceived: amountOut };
+  }
+
+  // =========================================================================
+  // WRITE: Swap sAVAX → WAVAX via KyberSwap (für Repay ohne Gateway)
+  // =========================================================================
+
+  async swapSAvaxForWavax(
+    sAvaxAmount: bigint,
+    onRetryExhausted?: () => Promise<boolean>,
+  ): Promise<{ hash: `0x${string}`; wavaxReceived: bigint }> {
+    console.log(`  → Swap ${formatEther(sAvaxAmount)} sAVAX → WAVAX via KyberSwap...`);
+
+    const wavaxBefore = await this.getBalance(ADDRESSES.WAVAX);
+
+    const quote = await this.kyberswap.fetchQuoteOnly(SAVAX_ADDRESS, ADDRESSES.WAVAX, sAvaxAmount);
+    await this.ensureApproval(ADDRESSES.sAVAX, quote.routerAddress, sAvaxAmount);
+
+    const { hash } = await this.kyberswap.swap(
+      SAVAX_ADDRESS,
+      ADDRESSES.WAVAX,
+      sAvaxAmount,
+      'WAVAX',
+      1,
+      onRetryExhausted,
+    );
+
+    // Echte WAVAX-Balance nach Swap lesen (zuverlässiger als amountOut aus Build-Response)
+    const wavaxAfter = await this.getBalance(ADDRESSES.WAVAX);
+    const wavaxReceived = wavaxAfter > wavaxBefore ? wavaxAfter - wavaxBefore : 0n;
+    console.log(`  ✓ Erhalten: ${formatEther(wavaxReceived)} WAVAX (Wallet: ${formatEther(wavaxAfter)} WAVAX)`);
+    return { hash, wavaxReceived };
   }
 
   // =========================================================================
@@ -311,7 +410,7 @@ export class AaveClient {
       functionName: 'withdraw',
       args: [amount],
     });
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Unwrapped: ${hash}`);
     return hash;
   }
@@ -333,7 +432,7 @@ export class AaveClient {
       args: [ADDRESSES.sAVAX, amount, this.userAddress, 0],
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Supplied: ${hash}`);
     return hash;
   }
@@ -358,7 +457,7 @@ export class AaveClient {
       ],
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Borrowed: ${hash}`);
     return hash;
   }
@@ -380,8 +479,29 @@ export class AaveClient {
       args: [ADDRESSES.WAVAX, amount, 2n, this.userAddress],
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Repaid: ${hash}`);
+    return hash;
+  }
+
+  // =========================================================================
+  // WRITE: Repay mit nativem AVAX via WrappedTokenGateway (kein WAVAX-Wrap)
+  // =========================================================================
+
+  async repayWithNativeAvax(avaxAmount: bigint): Promise<`0x${string}`> {
+    console.log(`  → Repay ${formatEther(avaxAmount)} AVAX via WrappedTokenGateway...`);
+
+    // amount = exakter avaxAmount der gesendet wird (value muss amount entsprechen)
+    const hash = await this.walletClient.writeContract({
+      address: ADDRESSES.wrappedTokenGateway,
+      abi: WRAPPED_TOKEN_GATEWAY_ABI,
+      functionName: 'repayETH',
+      args: [ADDRESSES.pool, avaxAmount, 2n, this.userAddress],
+      value: avaxAmount,
+    });
+
+    await this.waitForReceipt(hash);
+    console.log(`  ✓ Repaid via Gateway: ${hash}`);
     return hash;
   }
 
@@ -399,7 +519,7 @@ export class AaveClient {
       args: [ADDRESSES.sAVAX, amount, this.userAddress],
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.waitForReceipt(hash);
     console.log(`  ✓ Withdrawn: ${hash}`);
     return hash;
   }

@@ -146,21 +146,22 @@ export class RiskEngine {
     const numerator = targetHF * totalDebtUsd - totalCollateralUsd * lt;
     const denominator = sAvaxToAvaxRatio * lt - targetHF;
 
-    if (denominator <= 0 || numerator >= 0) {
-      // Kann Target-HF nicht mehr erreichen oder bereits darüber → kein weiterer Borrow
-      return 0n;
+    const maxBorrowUsd = snapshot.availableBorrowsUsd * 0.9;
+
+    let borrowUsd: number;
+
+    if (denominator === 0 || numerator / denominator <= 0) {
+      // Formel liefert kein positives Ergebnis (z.B. weil sAvaxRatio > targetHF/LT):
+      // Jeder Borrow verbessert den HF oder lässt ihn gleich → borge 90% des verfügbaren Limits.
+      borrowUsd = maxBorrowUsd;
+    } else {
+      borrowUsd = Math.min(numerator / denominator, maxBorrowUsd);
     }
 
-    const borrowUsd = Math.abs(numerator / denominator);
-    
-    // Safety: Max 90% der verfügbaren Borrow-Capacity pro Iteration
-    const maxBorrowUsd = snapshot.availableBorrowsUsd * 0.9;
-    const finalBorrowUsd = Math.min(borrowUsd, maxBorrowUsd);
-
     // Minimum: Nicht weniger als $1 borgen (Gas-kosten vs. Nutzen)
-    if (finalBorrowUsd < 1) return 0n;
+    if (borrowUsd < 1) return 0n;
 
-    return BigInt(Math.floor(finalBorrowUsd * 1e8));
+    return BigInt(Math.floor(borrowUsd * 1e8));
   }
 
   // =========================================================================

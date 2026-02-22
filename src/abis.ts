@@ -256,3 +256,21 @@ export const AAVE_ORACLE_ABI = [
     outputs: [{ name: '', type: 'uint256[]' }],
   },
 ] as const;
+
+// ---------------------------------------------------------------------------
+// Aave V3 WrappedTokenGateway – repay mit nativem AVAX (ohne WAVAX wrap)
+// ---------------------------------------------------------------------------
+export const WRAPPED_TOKEN_GATEWAY_ABI = [
+  {
+    name: 'repayETH',
+    type: 'function',
+    stateMutability: 'payable',
+    inputs: [
+      { name: 'pool', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'rateMode', type: 'uint256' },
+      { name: 'onBehalfOf', type: 'address' },
+    ],
+    outputs: [],
+  },
+] as const;

@@ -1,6 +1,9 @@
 # Environment variables (NEVER commit private keys!)
 .env
 
+# Encrypted keystore (enthält verschlüsselten Private Key – nicht committen)
+wallet.enc
+
 # Node.js
 node_modules/
 

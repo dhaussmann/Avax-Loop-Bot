@@ -97,6 +97,34 @@ export class KyberSwapClient {
   ) {}
 
   // =========================================================================
+  // INTERN: waitForReceipt – mit Retry bei "unfinalized data" RPC-Fehler
+  // =========================================================================
+
+  private async waitForReceipt(hash: `0x${string}`, maxRetries = 12): Promise<{ status: 'success' | 'reverted' }> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.publicClient.waitForTransactionReceipt({ hash, timeout: 90_000 });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isRetryable =
+          msg.includes('unfinalized') ||
+          msg.includes('cannot query') ||
+          msg.includes('could not be found') ||
+          msg.includes('not processed on a block') ||
+          msg.includes('TransactionReceiptNotFound');
+        if (isRetryable) {
+          const delay = attempt * 2000;
+          console.log(`  ⚠ Warte auf Tx-Bestätigung (Versuch ${attempt}/${maxRetries}, ${delay}ms)...`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error(`waitForReceipt: Tx ${hash} nach ${maxRetries} Versuchen nicht bestätigt.`);
+  }
+
+  // =========================================================================
   // Schritt 1: Route + Quote abfragen
   // =========================================================================
 
@@ -215,6 +243,7 @@ export class KyberSwapClient {
     amountIn: bigint,
     tokenOutSymbol: string = 'Token',
     _attempt: number = 1,
+    onRetryExhausted?: () => Promise<boolean>,
   ): Promise<{ hash: `0x${string}`; amountOut: bigint; quote: SwapQuote }> {
     // 1. Quote holen
     console.log(`  → Quote: ${formatEther(amountIn)} ${tokenIn === NATIVE_AVAX ? 'AVAX' : tokenIn.slice(0, 8)} → ${tokenOutSymbol}`);
@@ -231,7 +260,7 @@ export class KyberSwapClient {
       const msg = err instanceof Error ? err.message : String(err);
       if (_attempt < 3 && msg.includes('RFQ')) {
         console.log(`  ⚠ Build fehlgeschlagen (${msg.split('\n')[0]}), neuer Versuch ${_attempt + 1}/3...`);
-        return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, _attempt + 1);
+        return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, _attempt + 1, onRetryExhausted);
       }
       throw err;
     }
@@ -250,14 +279,24 @@ export class KyberSwapClient {
     console.log(`  → Tx gesendet: ${hash}`);
 
     // 4. Warten bis bestätigt
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+    const receipt = await this.waitForReceipt(hash);
 
     if (receipt.status !== 'success') {
       // On-chain Revert → frischen Quote + Retry (Slippage/Preis hat sich bewegt)
       if (_attempt < 3) {
         console.log(`  ⚠ Swap revertiert (${hash}), neuer Quote + Versuch ${_attempt + 1}/3...`);
         await new Promise(r => setTimeout(r, 2000));
-        return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, _attempt + 1);
+        return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, _attempt + 1, onRetryExhausted);
+      }
+      // 3 Versuche erschöpft → Nutzer befragen ob weitermachen
+      console.log(`  ✗ Swap fehlgeschlagen nach 3 Versuchen. Letzter Tx: ${hash}`);
+      if (onRetryExhausted) {
+        const retry = await onRetryExhausted();
+        if (retry) {
+          console.log('  → Starte neuen Versuchszyklus...');
+          await new Promise(r => setTimeout(r, 2000));
+          return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, 1, onRetryExhausted);
+        }
       }
       throw new Error(`Swap-Transaktion fehlgeschlagen nach ${_attempt} Versuchen: ${hash}`);
     }

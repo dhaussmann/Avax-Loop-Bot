@@ -53,6 +53,9 @@ export const ADDRESSES = {
 
   // DEX – LFJ (Trader Joe) V2.1 Router auf Avalanche
   lfjRouter: '0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30' as const,       // LB Router v2.1
+
+  // Aave V3 WrappedTokenGateway – repay mit nativem AVAX (kein WAVAX-Wrap nötig)
+  wrappedTokenGateway: '0x2825cE5921538d17cc15Ae00a8B24fF759C6CDaE' as const, // WETH_GATEWAY Avalanche Mainnet
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -70,10 +73,24 @@ export const EMODE = {
 // ---------------------------------------------------------------------------
 // Bot-Parameter
 // ---------------------------------------------------------------------------
-export const CONFIG = {
+export const CONFIG: {
+  chainId: number;
+  rpcUrl: string;
+  privateKey: `0x${string}`;
+  targetLeverage: number;
+  targetHF: number;
+  minHFForAction: number;
+  emergencyHF: number;
+  maxIterations: number;
+  slippageBps: number;
+  monitorIntervalMs: number;
+  maxGasPriceGwei: bigint;
+  gasLimitMultiplier: number;
+  gasReserveAvax: string;
+} = {
   chainId: avalanche.id,            // 43114
   rpcUrl: process.env.AVAX_RPC_URL || 'https://api.avax.network/ext/bc/C/rpc',
-  privateKey: process.env.PRIVATE_KEY as `0x${string}`,
+  privateKey: '' as `0x${string}`,  // wird nach Passwort-Eingabe gesetzt (keystore)
 
   // Leverage-Ziele
   targetLeverage: Number(process.env.TARGET_LEVERAGE) || 14,
@@ -96,7 +113,7 @@ export const CONFIG = {
 
   // Mindest-AVAX-Reserve die IMMER in der Wallet bleiben muss (für Gas)
   gasReserveAvax: '0.1',                                     // 0.1 AVAX ≈ 3-5 Txn-Gebühren auf Avalanche
-} as const;
+};
 
 // ---------------------------------------------------------------------------
 // Logging Helper
