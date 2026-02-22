@@ -33,13 +33,53 @@ export type RateCheckResult = {
   oracleDiffPct: number;
 };
 
+export type TxType = 'supply' | 'borrow' | 'swap' | 'withdraw' | 'repay';
+
+export type TxRecord = {
+  type: TxType;
+  hash: `0x${string}`;
+  timestamp: string;        // ISO 8601
+  tokenIn?: string;         // z.B. "AVAX", "WAVAX", "sAVAX"
+  amountIn?: string;        // formatEther-Wert
+  tokenOut?: string;
+  amountOut?: string;
+  rate?: string;            // z.B. "0.872341 sAVAX/WAVAX"
+  valueUsd?: string;        // USD-Wert zum Zeitpunkt
+  note?: string;            // z.B. "Iteration 3 – Borrow"
+  snowtraceUrl: string;     // https://snowtrace.io/tx/0x...
+};
+
 export type LoopResult = {
+  sessionId: string;              // z.B. "2025-02-22T14-30-00"
+  action: 'build' | 'unwind';
+  startedAt: string;              // ISO 8601
+  finishedAt: string;             // ISO 8601
   iterations: number;
+  initialSnapshot: AccountSnapshot;
   finalSnapshot: AccountSnapshot;
-  txHashes: string[];
+  txHashes: string[];             // Rückwärtskompatibilität
+  records: TxRecord[];            // strukturierte Tx-Einträge
   success: boolean;
   reason: string;
 };
+
+function rec(
+  type: TxType,
+  hash: `0x${string}`,
+  fields: Partial<Omit<TxRecord, 'type' | 'hash' | 'timestamp' | 'snowtraceUrl'>>,
+): TxRecord {
+  return {
+    type,
+    hash,
+    timestamp: new Date().toISOString(),
+    snowtraceUrl: `https://snowtrace.io/tx/${hash}`,
+    ...fields,
+  };
+}
+
+function sessionId(): string {
+  return new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+}
 
 // ---------------------------------------------------------------------------
 // LoopEngine Klasse
@@ -111,7 +151,10 @@ export class LoopEngine {
     confirmFn?: (rl: RLInterface, msg: string) => Promise<boolean>,
   ): Promise<LoopResult> {
     const txHashes: string[] = [];
+    const records: TxRecord[] = [];
     let iterations = 0;
+    const sid = sessionId();
+    const startedAt = new Date().toISOString();
 
     // Callback: nach 3 Swap-Fehlversuchen Nutzer befragen ob weitermachen
     const swapRetryCallback = (rl && confirmFn)
@@ -123,13 +166,20 @@ export class LoopEngine {
     console.log('║         LOOP ENGINE – BUILD LEVERAGE        ║');
     console.log('╚═════════════════════════════════════════════╝');
 
+    let initialSnap: AccountSnapshot | undefined;
+    const finish = (snap: AccountSnapshot, success: boolean, reason: string): LoopResult => ({
+      sessionId: sid, action: 'build', startedAt, finishedAt: new Date().toISOString(),
+      iterations, initialSnapshot: initialSnap ?? snap, finalSnapshot: snap,
+      txHashes, records, success, reason,
+    });
+
     // 1. E-Mode sicherstellen
     try {
       await this.aave.enableEMode();
     } catch (err) {
       console.error('  ✗ E-Mode konnte nicht aktiviert werden:', err);
       const snap = await this.aave.getAccountSnapshot();
-      return { iterations: 0, finalSnapshot: snap, txHashes, success: false, reason: 'E-Mode Fehler' };
+      return finish(snap, false, 'E-Mode Fehler');
     }
 
     // 2. sAVAX in Wallet immer zuerst supplyen (unabhängig von Collateral-Status)
@@ -138,61 +188,56 @@ export class LoopEngine {
       console.log(`\n  [INIT] Supply ${formatEther(walletSAvax)} sAVAX aus Wallet to Aave...`);
       const supplyHash = await this.aave.supplySAvax(walletSAvax);
       txHashes.push(supplyHash);
+      records.push(rec('supply', supplyHash, {
+        tokenIn: 'sAVAX', amountIn: formatEther(walletSAvax),
+        note: 'INIT – sAVAX aus Wallet supplyen',
+      }));
     }
 
     // 3. Falls Wallet-AVAX vorhanden und mehr wert als bestehendes Collateral → miteinbeziehen
-    //    (deckt auch den Fall ab wo minimales Rest-Collateral auf Aave liegt aber AVAX in Wallet)
-    const initialSnap = await this.aave.getAccountSnapshot();
+    initialSnap = await this.aave.getAccountSnapshot();
     const avaxBalanceCheck = await this.aave.getNativeBalance();
     const gasReserveCheck = parseEther(CONFIG.gasReserveAvax as `${number}`);
     const usableAvax = avaxBalanceCheck > gasReserveCheck ? avaxBalanceCheck - gasReserveCheck : 0n;
     const usableAvaxUsd = Number(formatEther(usableAvax)) * (Number(await this.aave.getAssetPrice(ADDRESSES.WAVAX)) / 1e8);
 
     if (usableAvax >= parseEther('0.01') && usableAvaxUsd > initialSnap.totalCollateralUsd * 0.1) {
-      const avaxBalance = avaxBalanceCheck;
-      const gasReserve = gasReserveCheck;
       const stakeAmount = usableAvax;
-
-      console.log(`\n  [INIT] Swap ${formatEther(stakeAmount)} AVAX → sAVAX (Gas-Reserve: ${gasReserve ? CONFIG.gasReserveAvax : '0'} AVAX)...`);
+      console.log(`\n  [INIT] Swap ${formatEther(stakeAmount)} AVAX → sAVAX (Gas-Reserve: ${CONFIG.gasReserveAvax} AVAX)...`);
       const { hash: stakeHash, sAvaxReceived } = await this.aave.stakeAvaxForSAvax(stakeAmount, swapRetryCallback);
       txHashes.push(stakeHash);
+      records.push(rec('swap', stakeHash, {
+        tokenIn: 'AVAX', amountIn: formatEther(stakeAmount),
+        tokenOut: 'sAVAX', amountOut: formatEther(sAvaxReceived),
+        rate: sAvaxReceived > 0n ? `${(Number(sAvaxReceived) / Number(stakeAmount)).toFixed(6)} sAVAX/AVAX` : undefined,
+        note: 'INIT – AVAX → sAVAX',
+      }));
 
       if (sAvaxReceived === 0n) {
-        return {
-          iterations: 0,
-          finalSnapshot: initialSnap,
-          txHashes,
-          success: false,
-          reason: 'Init-Swap AVAX→sAVAX lieferte 0 sAVAX – bitte Wallet-Balance prüfen.',
-        };
+        return finish(initialSnap, false, 'Init-Swap AVAX→sAVAX lieferte 0 sAVAX – bitte Wallet-Balance prüfen.');
       }
 
       console.log(`  [INIT] Supply ${formatEther(sAvaxReceived)} sAVAX to Aave...`);
       const supplyHash2 = await this.aave.supplySAvax(sAvaxReceived);
       txHashes.push(supplyHash2);
+      records.push(rec('supply', supplyHash2, {
+        tokenIn: 'sAVAX', amountIn: formatEther(sAvaxReceived),
+        note: 'INIT – sAVAX supplyen',
+      }));
     }
 
-    // 3. Loop: Borrow → Stake → Supply → Repeat
+    // 4. Loop: Borrow → Swap → Supply → Repeat
     while (iterations < CONFIG.maxIterations) {
       iterations++;
       console.log(`\n  ── Iteration ${iterations}/${CONFIG.maxIterations} ──`);
 
-      // Account Status holen
       const snap = await this.aave.getAccountSnapshot();
       const assessment = this.risk.assess(snap);
-
       console.log(`  HF: ${snap.healthFactor.toFixed(4)} | Leverage: ${snap.leverage.toFixed(2)}x | Action: ${assessment.action}`);
 
-      // Prüfe ob wir weitermachen sollen
       if (assessment.action !== 'LOOP_MORE') {
         console.log(`  → Stoppe Loop: ${assessment.reason}`);
-        return {
-          iterations,
-          finalSnapshot: snap,
-          txHashes,
-          success: true,
-          reason: assessment.reason,
-        };
+        return finish(snap, true, assessment.reason);
       }
 
       // Borrow-Betrag berechnen – KyberSwap Quote für aktuellen Kurs nutzen
@@ -204,35 +249,21 @@ export class LoopEngine {
 
       if (borrowAmountBase === 0n) {
         console.log('  → Kein weiterer Borrow sinnvoll');
-        return {
-          iterations,
-          finalSnapshot: snap,
-          txHashes,
-          success: true,
-          reason: 'Borrow-Menge zu klein',
-        };
+        return finish(snap, true, 'Borrow-Menge zu klein');
       }
 
-      // Konvertiere Base (USD, 8 dec) → WAVAX Token Amount (18 dec)
       const wavaxPrice = await this.aave.getAssetPrice(ADDRESSES.WAVAX);
       const borrowTokenAmount = this.risk.baseToTokenAmount(borrowAmountBase, wavaxPrice);
+      if (borrowTokenAmount === 0n) { console.log('  → Token-Betrag zu klein'); break; }
 
-      if (borrowTokenAmount === 0n) {
-        console.log('  → Token-Betrag zu klein');
-        break;
-      }
+      const borrowUsd = (Number(borrowAmountBase) / 1e8).toFixed(2);
+      console.log(`  Borrow: ${formatEther(borrowTokenAmount)} WAVAX ($${borrowUsd})`);
 
-      console.log(`  Borrow: ${formatEther(borrowTokenAmount)} WAVAX ($${(Number(borrowAmountBase) / 1e8).toFixed(2)})`);
-
-      // Bestätigung pro Iteration (nur wenn rl übergeben)
       if (rl && confirmFn) {
-        const ok = await confirmFn(
-          rl,
-          `Iteration ${iterations}: Borrow ${formatEther(borrowTokenAmount)} WAVAX → Stake → Supply ausführen?`,
-        );
+        const ok = await confirmFn(rl, `Iteration ${iterations}: Borrow ${formatEther(borrowTokenAmount)} WAVAX → Swap → Supply ausführen?`);
         if (!ok) {
           const currentSnap = await this.aave.getAccountSnapshot();
-          return { iterations, finalSnapshot: currentSnap, txHashes, success: true, reason: 'Vom Nutzer abgebrochen' };
+          return finish(currentSnap, true, 'Vom Nutzer abgebrochen');
         }
       }
 
@@ -240,46 +271,48 @@ export class LoopEngine {
         // a) Borrow WAVAX
         const borrowHash = await this.aave.borrowWavax(borrowTokenAmount);
         txHashes.push(borrowHash);
+        records.push(rec('borrow', borrowHash, {
+          tokenOut: 'WAVAX', amountOut: formatEther(borrowTokenAmount),
+          valueUsd: borrowUsd,
+          note: `Iteration ${iterations} – Borrow WAVAX`,
+        }));
 
-        // b) Swap WAVAX → sAVAX direkt via KyberSwap (kein Unwrap nötig)
+        // b) Swap WAVAX → sAVAX
         const { hash: stakeHash, sAvaxReceived } = await this.aave.swapWavaxForSAvax(borrowTokenAmount, swapRetryCallback);
         txHashes.push(stakeHash);
+        records.push(rec('swap', stakeHash, {
+          tokenIn: 'WAVAX', amountIn: formatEther(borrowTokenAmount),
+          tokenOut: 'sAVAX', amountOut: formatEther(sAvaxReceived),
+          rate: sAvaxReceived > 0n ? `${(Number(sAvaxReceived) / Number(borrowTokenAmount)).toFixed(6)} sAVAX/WAVAX` : undefined,
+          note: `Iteration ${iterations} – Swap WAVAX→sAVAX`,
+        }));
 
         if (sAvaxReceived === 0n) {
           console.log('  ✗ Kein sAVAX erhalten – breche ab');
           break;
         }
 
-        // d) Supply sAVAX to Aave
+        // c) Supply sAVAX
         const supplyHash = await this.aave.supplySAvax(sAvaxReceived);
         txHashes.push(supplyHash);
+        records.push(rec('supply', supplyHash, {
+          tokenIn: 'sAVAX', amountIn: formatEther(sAvaxReceived),
+          note: `Iteration ${iterations} – Supply sAVAX`,
+        }));
 
         console.log(`  ✓ Iteration ${iterations} erfolgreich`);
 
       } catch (err) {
         console.error(`  ✗ Fehler in Iteration ${iterations}:`, err);
         const currentSnap = await this.aave.getAccountSnapshot();
-        return {
-          iterations,
-          finalSnapshot: currentSnap,
-          txHashes,
-          success: false,
-          reason: `Fehler in Iteration ${iterations}: ${err}`,
-        };
+        return finish(currentSnap, false, `Fehler in Iteration ${iterations}: ${err}`);
       }
 
-      // Kurze Pause für RPC-Rate-Limits
       await sleep(2000);
     }
 
     const finalSnap = await this.aave.getAccountSnapshot();
-    return {
-      iterations,
-      finalSnapshot: finalSnap,
-      txHashes,
-      success: true,
-      reason: `Loop beendet nach ${iterations} Iterationen`,
-    };
+    return finish(finalSnap, true, `Loop beendet nach ${iterations} Iterationen`);
   }
 
   // =========================================================================
@@ -288,7 +321,10 @@ export class LoopEngine {
   
   async deleverage(targetHF?: number): Promise<LoopResult> {
     const txHashes: string[] = [];
+    const records: TxRecord[] = [];
     const desiredHF = targetHF || CONFIG.minHFForAction + 0.1;
+    const sid = sessionId();
+    const startedAt = new Date().toISOString();
 
     console.log('');
     console.log('╔═════════════════════════════════════════════╗');
@@ -296,23 +332,26 @@ export class LoopEngine {
     console.log('╚═════════════════════════════════════════════╝');
     console.log(`  Ziel-HF: ${desiredHF}`);
 
-    const snap = await this.aave.getAccountSnapshot();
-    
-    if (snap.healthFactor > desiredHF) {
-      console.log(`  HF ${snap.healthFactor.toFixed(4)} bereits über Ziel ${desiredHF} – nichts zu tun`);
-      return { iterations: 0, finalSnapshot: snap, txHashes, success: true, reason: 'Bereits sicher' };
-    }
-
-    if (snap.totalDebtUsd === 0) {
-      console.log('  Kein Debt vorhanden – nichts zu deleveragen');
-      return { iterations: 0, finalSnapshot: snap, txHashes, success: true, reason: 'Kein Debt' };
-    }
-
-    // Exchange Rate für Berechnung
-    const exchangeRate = await this.aave.getSAvaxExchangeRate();
-    
-    // Iteratives Deleverage (in Schritten, da Swap-Slippage die Berechnung beeinflusst)
+    const initialSnap = await this.aave.getAccountSnapshot();
     let iterations = 0;
+
+    const finish = (snap: AccountSnapshot, success: boolean, reason: string): LoopResult => ({
+      sessionId: sid, action: 'unwind', startedAt, finishedAt: new Date().toISOString(),
+      iterations, initialSnapshot: initialSnap, finalSnapshot: snap,
+      txHashes, records, success, reason,
+    });
+
+    if (initialSnap.healthFactor > desiredHF) {
+      console.log(`  HF ${initialSnap.healthFactor.toFixed(4)} bereits über Ziel ${desiredHF} – nichts zu tun`);
+      return finish(initialSnap, true, 'Bereits sicher');
+    }
+
+    if (initialSnap.totalDebtUsd === 0) {
+      console.log('  Kein Debt vorhanden – nichts zu deleveragen');
+      return finish(initialSnap, true, 'Kein Debt');
+    }
+
+    const exchangeRate = await this.aave.getSAvaxExchangeRate();
     const maxDeleverageIterations = 10;
 
     while (iterations < maxDeleverageIterations) {
@@ -320,34 +359,21 @@ export class LoopEngine {
       console.log(`\n  ── Deleverage Iteration ${iterations} ──`);
 
       const currentSnap = await this.aave.getAccountSnapshot();
-      
+
       if (currentSnap.healthFactor >= desiredHF) {
         console.log(`  ✓ Ziel-HF ${desiredHF} erreicht (aktuell: ${currentSnap.healthFactor.toFixed(4)})`);
-        return {
-          iterations,
-          finalSnapshot: currentSnap,
-          txHashes,
-          success: true,
-          reason: `Ziel-HF erreicht: ${currentSnap.healthFactor.toFixed(4)}`,
-        };
+        return finish(currentSnap, true, `Ziel-HF erreicht: ${currentSnap.healthFactor.toFixed(4)}`);
       }
 
-      // Berechne Repay-Betrag
-      const delevCalc = this.risk.calculateDeleverageAmount(
-        currentSnap,
-        desiredHF,
-        exchangeRate.avaxPerSAvax,
-      );
+      const delevCalc = this.risk.calculateDeleverageAmount(currentSnap, desiredHF, exchangeRate.avaxPerSAvax);
 
       if (delevCalc.repayAmountBase === 0n) {
         console.log('  → Repay-Betrag zu klein');
         break;
       }
 
-      // In Token-Beträge konvertieren
       const sAvaxPrice = await this.aave.getAssetPrice(ADDRESSES.sAVAX);
       const wavaxPrice = await this.aave.getAssetPrice(ADDRESSES.WAVAX);
-      
       const withdrawSAvaxAmount = this.risk.baseToTokenAmount(delevCalc.withdrawAmountBase, sAvaxPrice);
       const repayWavaxAmount = this.risk.baseToTokenAmount(delevCalc.repayAmountBase, wavaxPrice);
 
@@ -356,58 +382,33 @@ export class LoopEngine {
       console.log(`  Erwartet: HF ${delevCalc.estimatedNewHF.toFixed(4)}, Leverage ${delevCalc.estimatedNewLeverage.toFixed(2)}x`);
 
       try {
-        // a) Withdraw sAVAX from Aave
         const withdrawHash = await this.aave.withdrawSAvax(withdrawSAvaxAmount);
         txHashes.push(withdrawHash);
+        records.push(rec('withdraw', withdrawHash, {
+          tokenOut: 'sAVAX', amountOut: formatEther(withdrawSAvaxAmount),
+          note: `Deleverage ${iterations} – Withdraw`,
+        }));
 
-        // b) sAVAX → AVAX
-        //    Option 1: Via DEX (sofort, mit Slippage)
-        //    Option 2: Via BENQI unstake (15 Tage Wartezeit)
-        //    Hier: DEX-Swap simuliert → in Produktion LFJ/TraderJoe Router nutzen
-        //    WORKAROUND: Da wir im E-Mode sind und sAVAX/AVAX korreliert,
-        //    können wir alternativ sAVAX direkt als Repayment nutzen wenn
-        //    der Debt auch in sAVAX ist. Bei WAVAX-Debt müssen wir swappen.
-        
-        // Für WAVAX-Debt: sAVAX verkaufen → AVAX → WAVAX
-        // In Produktion: DEX Router Call hier einsetzen
-        // Placeholder: Wir nutzen den BENQI getPooledAvaxByShares für die Rate
-        
-        const avaxEquivalent = await this.getAvaxForSAvax(withdrawSAvaxAmount);
-        
-        // AVAX → WAVAX wrap (über native deposit)
-        // Hinweis: In Produktion müsstest du hier den DEX-Swap machen
-        // Für den Prototyp gehen wir davon aus, dass du WAVAX-Balance hast
-        // oder wir wrappen die native AVAX die wir vom sAVAX-Verkauf bekommen
-
-        // c) Repay WAVAX
         const repayHash = await this.aave.repayWavax(repayWavaxAmount);
         txHashes.push(repayHash);
+        records.push(rec('repay', repayHash, {
+          tokenIn: 'WAVAX', amountIn: formatEther(repayWavaxAmount),
+          note: `Deleverage ${iterations} – Repay`,
+        }));
 
         console.log(`  ✓ Deleverage Iteration ${iterations} erfolgreich`);
 
       } catch (err) {
         console.error(`  ✗ Fehler bei Deleverage:`, err);
         const errorSnap = await this.aave.getAccountSnapshot();
-        return {
-          iterations,
-          finalSnapshot: errorSnap,
-          txHashes,
-          success: false,
-          reason: `Deleverage Fehler: ${err}`,
-        };
+        return finish(errorSnap, false, `Deleverage Fehler: ${err}`);
       }
 
       await sleep(2000);
     }
 
     const finalSnap = await this.aave.getAccountSnapshot();
-    return {
-      iterations,
-      finalSnapshot: finalSnap,
-      txHashes,
-      success: true,
-      reason: `Deleverage beendet nach ${iterations} Iterationen`,
-    };
+    return finish(finalSnap, true, `Deleverage beendet nach ${iterations} Iterationen`);
   }
 
   // =========================================================================
@@ -455,8 +456,11 @@ export class LoopEngine {
     confirmFn?: (rl: RLInterface, msg: string) => Promise<boolean>,
   ): Promise<LoopResult> {
     const txHashes: string[] = [];
+    const records: TxRecord[] = [];
     let iterations = 0;
     const MAX_ITER = 50;
+    const sid = sessionId();
+    const startedAt = new Date().toISOString();
 
     // Callback: nach 3 Swap-Fehlversuchen Nutzer befragen ob weitermachen
     const swapRetryCallback = (rl && confirmFn)
@@ -468,29 +472,32 @@ export class LoopEngine {
     console.log('║       LOOP ENGINE – UNWIND POSITION         ║');
     console.log('╚═════════════════════════════════════════════╝');
 
+    const initialSnap = await this.aave.getAccountSnapshot();
+
+    const finish = (snap: AccountSnapshot, success: boolean, reason: string): LoopResult => ({
+      sessionId: sid, action: 'unwind', startedAt, finishedAt: new Date().toISOString(),
+      iterations, initialSnapshot: initialSnap, finalSnapshot: snap,
+      txHashes, records, success, reason,
+    });
+
     // ── Hilfsfunktion: WAVAX in Wallet als Repay einsetzen ───────────────────
-    // Zahlt min(walletWavax, openDebt) zurück.
-    // Gibt true zurück wenn ein Repay stattgefunden hat.
     const repayWavaxFromWallet = async (): Promise<boolean> => {
       const wavax = await this.aave.getBalance(ADDRESSES.WAVAX);
       if (wavax === 0n) return false;
       const snap = await this.aave.getAccountSnapshot();
       if (snap.totalDebtUsd < 0.05) return false;
 
-      // Offener Debt in WAVAX
       const wavaxPrice = await this.aave.getAssetPrice(ADDRESSES.WAVAX);
-      const debtWavax = this.risk.baseToTokenAmount(
-        BigInt(Math.floor(snap.totalDebtUsd * 1e8)),
-        wavaxPrice,
-      );
-
-      // Repay-Betrag: alle WAVAX wenn Debt größer, sonst nur Debt-Betrag
-      // MaxUint256 → Aave begrenzt automatisch auf offenen Debt (kein Überzug)
+      const debtWavax = this.risk.baseToTokenAmount(BigInt(Math.floor(snap.totalDebtUsd * 1e8)), wavaxPrice);
       const repayAmount = wavax >= debtWavax ? 2n ** 256n - 1n : wavax;
-      console.log(`  [PRE] Wallet: ${formatEther(wavax)} WAVAX | Offener Debt: ${formatEther(debtWavax)} WAVAX → Repay: ${repayAmount === 2n ** 256n - 1n ? 'MaxUint256 (alles)' : formatEther(repayAmount) + ' WAVAX'}`);
+      console.log(`  [PRE] Wallet: ${formatEther(wavax)} WAVAX | Debt: ${formatEther(debtWavax)} WAVAX → Repay: ${repayAmount === 2n ** 256n - 1n ? 'MaxUint256' : formatEther(repayAmount) + ' WAVAX'}`);
       try {
         const h = await this.aave.repayWavax(repayAmount);
         txHashes.push(h);
+        records.push(rec('repay', h, {
+          tokenIn: 'WAVAX', amountIn: formatEther(repayAmount === 2n ** 256n - 1n ? wavax : repayAmount),
+          note: 'PRE – WAVAX aus Wallet zurückzahlen',
+        }));
         console.log(`  ✓ WAVAX Repay erfolgreich`);
         return true;
       } catch (err) {
@@ -499,42 +506,47 @@ export class LoopEngine {
       }
     };
 
-    // ── Cleanup: Rest-Collateral abholen + alles zu AVAX tauschen ────────────
+    // ── Cleanup: Rest-Collateral abholen ─────────────────────────────────────
     const cleanup = async () => {
-      // 1. Verbliebenes Collateral von Aave (falls kein Debt mehr)
       const cleanSnap = await this.aave.getAccountSnapshot();
       if (cleanSnap.totalCollateralUsd > 0.01 && cleanSnap.totalDebtUsd < 0.05) {
         console.log(`  → Cleanup: Withdraw Rest-Collateral ($${cleanSnap.totalCollateralUsd.toFixed(4)}) von Aave...`);
         try {
           const wh = await this.aave.withdrawSAvax(2n ** 256n - 1n);
           txHashes.push(wh);
-        } catch (err) {
-          console.log(`  ⚠ Collateral-Withdraw fehlgeschlagen: ${err}`);
-        }
+          records.push(rec('withdraw', wh, {
+            tokenOut: 'sAVAX',
+            note: 'Cleanup – Rest-Collateral von Aave',
+          }));
+        } catch (err) { console.log(`  ⚠ Collateral-Withdraw fehlgeschlagen: ${err}`); }
       }
-      // 2. sAVAX in Wallet → AVAX
       const walletSAvax = await this.aave.getBalance(ADDRESSES.sAVAX);
       if (walletSAvax > 0n) {
         console.log(`  → Cleanup: Swap ${formatEther(walletSAvax)} sAVAX → AVAX...`);
         try {
           const { hash: sh } = await this.aave.swapSAvaxForAvax(walletSAvax, swapRetryCallback);
           txHashes.push(sh);
-        } catch (err) {
-          console.log(`  ⚠ sAVAX→AVAX Swap fehlgeschlagen: ${err}`);
-        }
+          records.push(rec('swap', sh, {
+            tokenIn: 'sAVAX', amountIn: formatEther(walletSAvax),
+            tokenOut: 'AVAX',
+            note: 'Cleanup – sAVAX → AVAX',
+          }));
+        } catch (err) { console.log(`  ⚠ sAVAX→AVAX Swap fehlgeschlagen: ${err}`); }
       }
-      // 3. WAVAX in Wallet → AVAX unwrappen
       const walletWavax2 = await this.aave.getBalance(ADDRESSES.WAVAX);
       if (walletWavax2 > 0n) {
         console.log(`  → Cleanup: Unwrap ${formatEther(walletWavax2)} WAVAX → AVAX...`);
         try {
           const uh = await this.aave.unwrapWavax(walletWavax2);
           txHashes.push(uh);
-        } catch (err) {
-          console.log(`  ⚠ WAVAX Unwrap fehlgeschlagen: ${err}`);
-        }
+          records.push(rec('swap', uh, {
+            tokenIn: 'WAVAX', amountIn: formatEther(walletWavax2),
+            tokenOut: 'AVAX', amountOut: formatEther(walletWavax2),
+            rate: '1.000000 AVAX/WAVAX',
+            note: 'Cleanup – WAVAX unwrappen',
+          }));
+        } catch (err) { console.log(`  ⚠ WAVAX Unwrap fehlgeschlagen: ${err}`); }
       }
-      // 4. Finale Balance
       const finalAvax = await this.aave.getNativeBalance();
       const finalSAvax = await this.aave.getBalance(ADDRESSES.sAVAX);
       const finalWavax = await this.aave.getBalance(ADDRESSES.WAVAX);
@@ -551,31 +563,23 @@ export class LoopEngine {
       const snap = await this.aave.getAccountSnapshot();
       console.log(`  HF: ${snap.healthFactor.toFixed(4)} | Leverage: ${snap.leverage.toFixed(2)}x | Debt: $${snap.totalDebtUsd.toFixed(2)} | Collateral: $${snap.totalCollateralUsd.toFixed(2)}`);
 
-      // Fertig wenn kein Debt mehr
       if (snap.totalDebtUsd < 0.05) {
         console.log('  ✓ Kein Debt mehr – Unwind abgeschlossen.');
         await cleanup();
         const finalSnap = await this.aave.getAccountSnapshot();
-        return { iterations, finalSnapshot: finalSnap, txHashes, success: true, reason: 'Unwind abgeschlossen' };
+        return finish(finalSnap, true, 'Unwind abgeschlossen');
       }
 
-      // ── Schritt 1: Withdraw-Menge berechnen ───────────────────────────────
-      // Ziel: so viel sAVAX withdrawen wie nötig um den gesamten Debt zurückzuzahlen
-      // (inkl. Slippage-Buffer), aber max. was Aave bei HF ≥ 1.001 erlaubt.
       const sAvaxPrice = await this.aave.getAssetPrice(ADDRESSES.sAVAX);
       const wavaxPrice = await this.aave.getAssetPrice(ADDRESSES.WAVAX);
       const lt = snap.liquidationThresholdPct / 100;
-      const sAvaxRatio = Number(sAvaxPrice) / Number(wavaxPrice); // sAVAX-Wert in WAVAX-Einheiten
+      const sAvaxRatio = Number(sAvaxPrice) / Number(wavaxPrice);
 
-      // Gewünschter Withdraw: genug um gesamten Debt zu decken + Slippage
       const targetWithdrawUsd = snap.totalDebtUsd * sAvaxRatio * (1 + CONFIG.slippageBps / 10000);
-
-      // Maximum was Aave erlaubt (HF nach Withdraw ≥ 1.001)
       const minHFForWithdraw = 1.001;
       const maxWithdrawUsd = snap.totalCollateralUsd - (minHFForWithdraw * snap.totalDebtUsd / lt);
 
       if (maxWithdrawUsd <= 0) {
-        // HF zu niedrig – erst WAVAX aus Wallet repay'en falls vorhanden
         const repaid = await repayWavaxFromWallet();
         if (!repaid) {
           console.log('  ✗ HF zu niedrig und kein WAVAX in Wallet – Unwind blockiert.');
@@ -585,68 +589,69 @@ export class LoopEngine {
         continue;
       }
 
-      // Nehme das Minimum aus gewünschtem und maximal erlaubtem Withdraw
       const withdrawUsd = Math.min(targetWithdrawUsd, maxWithdrawUsd);
-      let withdrawSAvax = this.risk.baseToTokenAmount(
-        BigInt(Math.floor(withdrawUsd * 1e8)),
-        sAvaxPrice,
-      );
+      let withdrawSAvax = this.risk.baseToTokenAmount(BigInt(Math.floor(withdrawUsd * 1e8)), sAvaxPrice);
 
-      // Clamp auf verfügbare aToken-Balance
       const aSAvaxBalance = await this.aave.getBalance(ADDRESSES.aSAVAX);
-      if (withdrawSAvax > aSAvaxBalance) {
-        withdrawSAvax = aSAvaxBalance;
-      }
+      if (withdrawSAvax > aSAvaxBalance) withdrawSAvax = aSAvaxBalance;
 
       if (withdrawSAvax === 0n) {
         console.log('  ✗ Withdraw-Betrag = 0 – abgebrochen.');
         break;
       }
 
-      const wavaxDebtToken = this.risk.baseToTokenAmount(
-        BigInt(Math.floor(snap.totalDebtUsd * 1e8)),
-        wavaxPrice,
-      );
+      const wavaxDebtToken = this.risk.baseToTokenAmount(BigInt(Math.floor(snap.totalDebtUsd * 1e8)), wavaxPrice);
       console.log(`  Debt:     $${snap.totalDebtUsd.toFixed(2)} (≈ ${formatEther(wavaxDebtToken)} WAVAX)`);
-      console.log(`  Withdraw: ${formatEther(withdrawSAvax)} sAVAX ($${withdrawUsd.toFixed(2)}, max erlaubt: $${maxWithdrawUsd.toFixed(2)})`);
+      console.log(`  Withdraw: ${formatEther(withdrawSAvax)} sAVAX ($${withdrawUsd.toFixed(2)}, max: $${maxWithdrawUsd.toFixed(2)})`);
 
-      // Bestätigung (wenn interaktiv)
       if (rl && confirmFn) {
         const ok = await confirmFn(rl, `Iteration ${iterations}: ${formatEther(withdrawSAvax)} sAVAX withdraw → swap → repay?`);
         if (!ok) {
           await cleanup();
           const currentSnap = await this.aave.getAccountSnapshot();
-          return { iterations, finalSnapshot: currentSnap, txHashes, success: true, reason: 'Vom Nutzer abgebrochen' };
+          return finish(currentSnap, true, 'Vom Nutzer abgebrochen');
         }
       }
 
       try {
-        // ── Schritt 2: Withdraw sAVAX ────────────────────────────────────────
+        // Schritt 2: Withdraw sAVAX
         const withdrawHash = await this.aave.withdrawSAvax(withdrawSAvax);
         txHashes.push(withdrawHash);
+        records.push(rec('withdraw', withdrawHash, {
+          tokenOut: 'sAVAX', amountOut: formatEther(withdrawSAvax),
+          valueUsd: withdrawUsd.toFixed(2),
+          note: `Iteration ${iterations} – Withdraw sAVAX`,
+        }));
 
-        // ── Schritt 3: sAVAX → WAVAX via KyberSwap ──────────────────────────
+        // Schritt 3: sAVAX → WAVAX
         const sAvaxInWallet = await this.aave.getBalance(ADDRESSES.sAVAX);
         const swapAmount = sAvaxInWallet > 0n ? sAvaxInWallet : withdrawSAvax;
         const { hash: swapHash } = await this.aave.swapSAvaxForWavax(swapAmount, swapRetryCallback);
         txHashes.push(swapHash);
 
-        // ── Schritt 4: WAVAX repay'en ─────────────────────────────────────────
-        // Alle WAVAX in Wallet lesen (echte On-Chain-Balance nach Swap-Bestätigung)
         const wavaxInWallet = await this.aave.getBalance(ADDRESSES.WAVAX);
+        records.push(rec('swap', swapHash, {
+          tokenIn: 'sAVAX', amountIn: formatEther(swapAmount),
+          tokenOut: 'WAVAX', amountOut: formatEther(wavaxInWallet),
+          rate: wavaxInWallet > 0n ? `${(Number(wavaxInWallet) / Number(swapAmount)).toFixed(6)} WAVAX/sAVAX` : undefined,
+          note: `Iteration ${iterations} – Swap sAVAX→WAVAX`,
+        }));
+
+        // Schritt 4: WAVAX repay
         if (wavaxInWallet === 0n) {
           console.log('  ⚠ Kein WAVAX in Wallet nach Swap – überspringe Repay');
           continue;
         }
         const currentSnap = await this.aave.getAccountSnapshot();
-        const currentDebtWavax = this.risk.baseToTokenAmount(
-          BigInt(Math.floor(currentSnap.totalDebtUsd * 1e8)),
-          wavaxPrice,
-        );
-        // Wenn WAVAX >= Debt → MaxUint256 damit Aave exakt den Debt abzieht (kein Überzug)
+        const currentDebtWavax = this.risk.baseToTokenAmount(BigInt(Math.floor(currentSnap.totalDebtUsd * 1e8)), wavaxPrice);
         const repayAmount = wavaxInWallet >= currentDebtWavax ? 2n ** 256n - 1n : wavaxInWallet;
         const repayHash = await this.aave.repayWavax(repayAmount);
         txHashes.push(repayHash);
+        records.push(rec('repay', repayHash, {
+          tokenIn: 'WAVAX', amountIn: formatEther(wavaxInWallet),
+          valueUsd: (Number(wavaxInWallet) * Number(wavaxPrice) / 1e26).toFixed(2),
+          note: `Iteration ${iterations} – Repay WAVAX`,
+        }));
 
         console.log(`  ✓ Iteration ${iterations} erfolgreich (${formatEther(wavaxInWallet)} WAVAX repaid)`);
 
@@ -654,28 +659,15 @@ export class LoopEngine {
         console.error(`  ✗ Fehler in Unwind-Iteration ${iterations}:`, err);
         await cleanup();
         const errorSnap = await this.aave.getAccountSnapshot();
-        return {
-          iterations,
-          finalSnapshot: errorSnap,
-          txHashes,
-          success: false,
-          reason: `Unwind Fehler in Iteration ${iterations}: ${err}`,
-        };
+        return finish(errorSnap, false, `Unwind Fehler in Iteration ${iterations}: ${err}`);
       }
 
       await sleep(2000);
     }
 
-    // Schleife beendet – Cleanup
     await cleanup();
     const finalSnap = await this.aave.getAccountSnapshot();
-    return {
-      iterations,
-      finalSnapshot: finalSnap,
-      txHashes,
-      success: true,
-      reason: `Unwind beendet nach ${iterations} Iterationen`,
-    };
+    return finish(finalSnap, true, `Unwind beendet nach ${iterations} Iterationen`);
   }
 
   // =========================================================================

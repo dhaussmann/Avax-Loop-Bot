@@ -23,6 +23,7 @@ import { LoopEngine } from './loopEngine.js';
 import { Monitor } from './monitor.js';
 import { CONFIG, EMODE, logConfig } from './config.js';
 import { keystoreExists, createKeystore, loadKeystore, promptPassword } from './keystore.js';
+import { saveSessionLog, printSessionSummary } from './logger.js';
 
 const KEYSTORE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'wallet.enc');
 
@@ -560,19 +561,8 @@ async function main() {
       if (!ok) { console.log('  Abgebrochen.'); break; }
 
       const result = await loop.buildLoop(rl, confirm);
-
-      console.log('\n═══════════════════════════════════════════════');
-      console.log('  LOOP RESULT');
-      console.log('═══════════════════════════════════════════════');
-      console.log(`  Success:     ${result.success}`);
-      console.log(`  Iterations:  ${result.iterations}`);
-      console.log(`  HF:          ${result.finalSnapshot.healthFactor.toFixed(4)}`);
-      console.log(`  Leverage:    ${result.finalSnapshot.leverage.toFixed(2)}x`);
-      console.log(`  Collateral:  $${result.finalSnapshot.totalCollateralUsd.toFixed(2)}`);
-      console.log(`  Debt:        $${result.finalSnapshot.totalDebtUsd.toFixed(2)}`);
-      console.log(`  Txns:        ${result.txHashes.length}`);
-      console.log(`  Reason:      ${result.reason}`);
-      console.log('═══════════════════════════════════════════════');
+      printSessionSummary(result);
+      saveSessionLog(result);
       break;
     }
 
@@ -651,31 +641,9 @@ async function main() {
     // =====================================================================
     // UNWIND: Alle Positionen schließen
     // =====================================================================
-    case 'unwind': {
-      console.log('⚠️  WARNUNG: Dies schließt ALLE Aave-Positionen!');
-      const snap = await aave.printStatus();
-
-      if (snap.totalDebtUsd === 0 && snap.totalCollateralUsd === 0) {
-        console.log('  Keine offenen Positionen.');
-        break;
-      }
-
-      const ok = await confirm(rl, 'Wirklich ALLE Positionen schließen?');
-      if (!ok) { console.log('  Abgebrochen.'); break; }
-      const ok2 = await confirm(rl, 'Bist du sicher? Dies kann nicht rückgängig gemacht werden.');
-      if (!ok2) { console.log('  Abgebrochen.'); break; }
-
-      const result = await loop.unwindLoop(rl, confirm);
-      console.log(`\n  Result: ${result.success ? '✓' : '✗'} – ${result.reason}`);
-      await aave.printStatus();
-      break;
-    }
-
-    // =====================================================================
-    // UNWIND-LOOP: identisch mit unwind (beide nutzen unwindLoop)
-    // =====================================================================
+    case 'unwind':
     case 'unwind-loop': {
-      console.log('⚠️  WARNUNG: Dies baut den gesamten Leverage iterativ ab!');
+      console.log('⚠️  WARNUNG: Dies schließt ALLE Aave-Positionen!');
       const snap = await aave.printStatus();
 
       if (snap.totalDebtUsd === 0 && snap.totalCollateralUsd === 0) {
@@ -696,23 +664,14 @@ async function main() {
         break;
       }
 
-      const ok = await confirm(rl, 'Loop-Abbau starten? (iterativ, mit HF-Sicherheitscheck)');
+      const ok = await confirm(rl, 'Wirklich ALLE Positionen schließen?');
       if (!ok) { console.log('  Abgebrochen.'); break; }
+      const ok2 = await confirm(rl, 'Bist du sicher? Dies kann nicht rückgängig gemacht werden.');
+      if (!ok2) { console.log('  Abgebrochen.'); break; }
 
       const result = await loop.unwindLoop(rl, confirm);
-
-      console.log('\n═══════════════════════════════════════════════');
-      console.log('  UNWIND RESULT');
-      console.log('═══════════════════════════════════════════════');
-      console.log(`  Success:     ${result.success}`);
-      console.log(`  Iterations:  ${result.iterations}`);
-      console.log(`  HF:          ${result.finalSnapshot.healthFactor.toFixed(4)}`);
-      console.log(`  Leverage:    ${result.finalSnapshot.leverage.toFixed(2)}x`);
-      console.log(`  Collateral:  $${result.finalSnapshot.totalCollateralUsd.toFixed(2)}`);
-      console.log(`  Debt:        $${result.finalSnapshot.totalDebtUsd.toFixed(2)}`);
-      console.log(`  Txns:        ${result.txHashes.length}`);
-      console.log(`  Reason:      ${result.reason}`);
-      console.log('═══════════════════════════════════════════════');
+      printSessionSummary(result);
+      saveSessionLog(result);
       await aave.printStatus();
       break;
     }
