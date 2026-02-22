@@ -169,6 +169,25 @@ export class AaveClient {
     });
   }
 
+  /**
+   * Liest die Balance wiederholt bis sie sich gegenüber `before` erhöht hat.
+   * Nötig weil RPC-Nodes nach einem Block manchmal noch den alten Stand liefern.
+   */
+  private async getBalanceAfterTx(
+    token: `0x${string}`,
+    before: bigint,
+    maxRetries = 8,
+    delayMs = 1500,
+  ): Promise<bigint> {
+    for (let i = 0; i < maxRetries; i++) {
+      const bal = await this.getBalance(token);
+      if (bal > before) return bal;
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+    // Fallback: letzter gelesener Wert (kann gleich before sein)
+    return this.getBalance(token);
+  }
+
   async getNativeBalance(): Promise<bigint> {
     return this.publicClient.getBalance({ address: this.userAddress });
   }
@@ -239,12 +258,14 @@ export class AaveClient {
     spender: `0x${string}`,
     amount: bigint,
   ): Promise<void> {
-    const currentAllowance = await this.publicClient.readContract({
+    const readAllowance = () => this.publicClient.readContract({
       address: token,
       abi: ERC20_ABI,
       functionName: 'allowance',
       args: [this.userAddress, spender],
     });
+
+    const currentAllowance = await readAllowance();
 
     if (currentAllowance >= amount) {
       return; // Bereits genug approved
@@ -259,6 +280,14 @@ export class AaveClient {
     });
 
     await this.waitForReceipt(hash);
+
+    // Warten bis RPC-Node die neue Allowance reflektiert (Timing-Bug auf Avalanche RPC)
+    for (let i = 0; i < 8; i++) {
+      const confirmed = await readAllowance();
+      if (confirmed >= amount) break;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+
     console.log(`  ✓ Approved: ${hash}`);
   }
 
@@ -272,7 +301,10 @@ export class AaveClient {
   ): Promise<{ hash: `0x${string}`; sAvaxReceived: bigint; quote: import('./kyberswap.js').SwapQuote }> {
     console.log(`  → Swap ${formatEther(avaxAmount)} AVAX → sAVAX via KyberSwap...`);
 
-    const { hash, amountOut, quote } = await this.kyberswap.swap(
+    // Balance vor dem Swap messen
+    const sAvaxBefore = await this.getBalance(ADDRESSES.sAVAX);
+
+    const { hash, quote } = await this.kyberswap.swap(
       NATIVE_AVAX,
       SAVAX_ADDRESS,
       avaxAmount,
@@ -281,9 +313,11 @@ export class AaveClient {
       onRetryExhausted,
     );
 
-    // amountOut aus KyberSwap Build-Response verwenden (zuverlässiger als Balance-Differenz)
-    console.log(`  ✓ Erhalten: ${formatEther(amountOut)} sAVAX`);
-    return { hash, sAvaxReceived: amountOut, quote };
+    // Echte sAVAX-Balance nach Swap lesen – mit Retry falls RPC-Node noch alten Stand liefert
+    const sAvaxAfter = await this.getBalanceAfterTx(ADDRESSES.sAVAX, sAvaxBefore);
+    const sAvaxReceived = sAvaxAfter > sAvaxBefore ? sAvaxAfter - sAvaxBefore : 0n;
+    console.log(`  ✓ Erhalten: ${formatEther(sAvaxReceived)} sAVAX (Wallet: ${formatEther(sAvaxAfter)} sAVAX)`);
+    return { hash, sAvaxReceived, quote };
   }
 
   /** @deprecated Verwende swapAvaxForSAvax() – bleibt für Rückwärtskompatibilität */
@@ -309,7 +343,10 @@ export class AaveClient {
     const quote = await this.kyberswap.fetchQuoteOnly(ADDRESSES.WAVAX, SAVAX_ADDRESS, wavaxAmount);
     await this.ensureApproval(ADDRESSES.WAVAX, quote.routerAddress, wavaxAmount);
 
-    const { hash, amountOut } = await this.kyberswap.swap(
+    // Balance vor dem Swap messen
+    const sAvaxBefore = await this.getBalance(ADDRESSES.sAVAX);
+
+    const { hash } = await this.kyberswap.swap(
       ADDRESSES.WAVAX,
       SAVAX_ADDRESS,
       wavaxAmount,
@@ -318,8 +355,11 @@ export class AaveClient {
       onRetryExhausted,
     );
 
-    console.log(`  ✓ Erhalten: ${formatEther(amountOut)} sAVAX`);
-    return { hash, sAvaxReceived: amountOut };
+    // Echte sAVAX-Balance nach Swap lesen – mit Retry falls RPC-Node noch alten Stand liefert
+    const sAvaxAfter = await this.getBalanceAfterTx(ADDRESSES.sAVAX, sAvaxBefore);
+    const sAvaxReceived = sAvaxAfter > sAvaxBefore ? sAvaxAfter - sAvaxBefore : 0n;
+    console.log(`  ✓ Erhalten: ${formatEther(sAvaxReceived)} sAVAX (Wallet: ${formatEther(sAvaxAfter)} sAVAX)`);
+    return { hash, sAvaxReceived };
   }
 
   // =========================================================================
@@ -391,8 +431,8 @@ export class AaveClient {
       onRetryExhausted,
     );
 
-    // Echte WAVAX-Balance nach Swap lesen (zuverlässiger als amountOut aus Build-Response)
-    const wavaxAfter = await this.getBalance(ADDRESSES.WAVAX);
+    // Echte WAVAX-Balance nach Swap lesen – mit Retry falls RPC-Node noch alten Stand liefert
+    const wavaxAfter = await this.getBalanceAfterTx(ADDRESSES.WAVAX, wavaxBefore);
     const wavaxReceived = wavaxAfter > wavaxBefore ? wavaxAfter - wavaxBefore : 0n;
     console.log(`  ✓ Erhalten: ${formatEther(wavaxReceived)} WAVAX (Wallet: ${formatEther(wavaxAfter)} WAVAX)`);
     return { hash, wavaxReceived };

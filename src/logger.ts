@@ -23,8 +23,10 @@ export function saveSessionLog(result: LoopResult): string {
   const filename = `${result.sessionId}_${result.action}.json`;
   const filepath = join(LOGS_DIR, filename);
 
-  // BigInt-Werte in LoopResult gibt es nicht (alle Werte sind number/string)
-  writeFileSync(filepath, JSON.stringify(result, null, 2), 'utf8');
+  // AccountSnapshot.raw enthält BigInt-Felder → als String serialisieren
+  writeFileSync(filepath, JSON.stringify(result, (_key, val) =>
+    typeof val === 'bigint' ? val.toString() : val
+  , 2), 'utf8');
   console.log(`\n  Log gespeichert: logs/${filename}`);
   return filepath;
 }

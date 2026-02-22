@@ -282,10 +282,11 @@ export class KyberSwapClient {
     const receipt = await this.waitForReceipt(hash);
 
     if (receipt.status !== 'success') {
-      // On-chain Revert → frischen Quote + Retry (Slippage/Preis hat sich bewegt)
+      // On-chain Revert → frischen Quote holen + länger warten (Preis hat sich kurz bewegt)
       if (_attempt < 3) {
-        console.log(`  ⚠ Swap revertiert (${hash}), neuer Quote + Versuch ${_attempt + 1}/3...`);
-        await new Promise(r => setTimeout(r, 2000));
+        const waitMs = _attempt * 5000; // 5s nach Versuch 1, 10s nach Versuch 2
+        console.log(`  ⚠ Swap revertiert (${hash}), warte ${waitMs / 1000}s + neuer Quote, Versuch ${_attempt + 1}/3...`);
+        await new Promise(r => setTimeout(r, waitMs));
         return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, _attempt + 1, onRetryExhausted);
       }
       // 3 Versuche erschöpft → Nutzer befragen ob weitermachen
@@ -294,7 +295,7 @@ export class KyberSwapClient {
         const retry = await onRetryExhausted();
         if (retry) {
           console.log('  → Starte neuen Versuchszyklus...');
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 3000));
           return this.swap(tokenIn, tokenOut, amountIn, tokenOutSymbol, 1, onRetryExhausted);
         }
       }
