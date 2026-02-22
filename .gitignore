@@ -1,0 +1,23 @@
+# Environment variables (NEVER commit private keys!)
+.env
+
+# Node.js
+node_modules/
+
+# TypeScript build output
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Claude
+.claude/

@@ -1,0 +1,25 @@
+{
+  "name": "savax-loop-bot",
+  "version": "1.0.0",
+  "description": "sAVAX Loop Bot for Aave v3 Avalanche with HF Monitoring & Auto-Protection",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "loop": "tsx src/index.ts --action=loop",
+    "monitor": "tsx src/index.ts --action=monitor",
+    "status": "tsx src/index.ts --action=status",
+    "deleverage": "tsx src/index.ts --action=deleverage",
+    "unwind": "tsx src/index.ts --action=unwind-loop"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}
